@@ -6,6 +6,7 @@ Purpose:
     - Downloads RAUL 2.0.zip
     - Extracts RAULDASH and RAULMANUAL
     - Updates settings.xml in both folders
+    - Repairs RAULMANUAL Flask template/settings layout when needed
     - Updates RAULMANUAL raul_config.xml tab_name
     - Optionally changes RAULMANUAL port
     - Installs shared RAUL requirements.txt once from RAULDASH
@@ -171,6 +172,45 @@ function Save-XmlDocument {
     }
     finally {
         $writer.Close()
+    }
+}
+
+function Ensure-RaulManualPackageLayout {
+    param(
+        [string]$ManualFolder,
+        [string]$DashFolder
+    )
+
+    # Flask render_template() expects templates in a "templates" subfolder.
+    $templatesFolder = Join-Path $ManualFolder "templates"
+    New-Item -ItemType Directory -Path $templatesFolder -Force | Out-Null
+
+    foreach ($templateName in @("raul_manual.html", "settings.html")) {
+        $rootTemplate = Join-Path $ManualFolder $templateName
+        $templateTarget = Join-Path $templatesFolder $templateName
+
+        if ((Test-Path $rootTemplate) -and -not (Test-Path $templateTarget)) {
+            Copy-Item -Path $rootTemplate -Destination $templateTarget -Force
+            Write-OK "Placed $templateName in Flask templates folder."
+        }
+    }
+
+    # The updated RAUL Manual backend reads ProjectName from settings.xml.
+    # If Manual does not contain it, seed it from RAULDASH.
+    $manualSettings = Join-Path $ManualFolder "settings.xml"
+
+    if (-not (Test-Path $manualSettings)) {
+        $dashSettings = Get-FirstExistingPath @(
+            (Join-Path $DashFolder "settings.xml"),
+            (Join-Path $DashFolder "settings")
+        )
+
+        if (-not $dashSettings) {
+            throw "Could not create RAULMANUAL settings.xml because RAULDASH settings.xml/settings was not found."
+        }
+
+        Copy-Item -Path $dashSettings -Destination $manualSettings -Force
+        Write-OK "Created missing RAULMANUAL settings.xml from RAULDASH settings."
     }
 }
 
@@ -538,7 +578,13 @@ Copy-Item -Path $manualSource.FullName -Destination $InstallRoot -Recurse -Force
 $DashFolder = Join-Path $InstallRoot "RAULDASH"
 $ManualFolder = Join-Path $InstallRoot "RAULMANUAL"
 
+# Install shared Python requirements first so a configuration/layout issue cannot
+# leave RAULMANUAL without its dependencies.
+Install-PythonRequirements -PythonCommand $pythonCommand -DashFolder $DashFolder
+
+# Configure RAULDASH first, then repair/seed the current RAULMANUAL package layout.
 Update-SettingsXml -Folder $DashFolder -TabName $tabName -ProjectName $projectName
+Ensure-RaulManualPackageLayout -ManualFolder $ManualFolder -DashFolder $DashFolder
 Update-SettingsXml -Folder $ManualFolder -TabName $tabName -ProjectName $projectName
 Update-RaulConfig -ManualFolder $ManualFolder -TabName $tabName
 
@@ -555,11 +601,10 @@ else {
     }
     else {
         $finalPort = 5000
-        Write-Warn "Could not detect current port. Startup file will use 5000."
+        Write-Warn "Could not detect packaged RAULMANUAL port. Using default port 5000."
     }
 }
 
-Install-PythonRequirements -PythonCommand $pythonCommand -DashFolder $DashFolder
 Update-FirewallForPort -Port $finalPort
 Create-StartupBat -PythonCommand $pythonCommand -DashFolder $DashFolder -ManualFolder $ManualFolder -Port $finalPort
 
