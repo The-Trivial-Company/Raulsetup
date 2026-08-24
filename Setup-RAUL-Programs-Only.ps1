@@ -8,8 +8,8 @@ Purpose:
     - Updates settings.xml in both folders
     - Updates RAULMANUAL raul_config.xml tab_name
     - Optionally changes RAULMANUAL port
-    - Installs RAULDASH requirements.txt
-    - Installs Flask
+    - Installs shared RAUL requirements.txt once from RAULDASH
+    - Installs Flask for RAULMANUAL
     - Creates startup BAT for both RAUL programs
 
 Run:
@@ -20,7 +20,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # ===== RAUL DOWNLOAD LINK =====
-$RaulZipUrl = "https://drive.google.com/file/d/1EYRUZByBWuTKHPfY0sN6Lw_IQgSYTmu_/view?usp=sharing"
+$RaulZipUrl = "https://drive.google.com/file/d/1VpRz3Wj2xd3TcItPsMvSAF9Kv6BVnPRH/view?usp=sharing"
 
 # ===== PATHS =====
 $InstallRoot = Join-Path $env:USERPROFILE "Downloads\RAUL 2.0"
@@ -267,29 +267,74 @@ function Update-RaulManualPort {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     $content = [System.IO.File]::ReadAllText($manualPy, [System.Text.Encoding]::UTF8)
 
-    # Match the whole app.run(...) line, even if spacing is different.
-    $pattern = '(?m)^\s*app\.run\(.*?\)\s*$'
+    $pattern = 'app\.run\s*\((?<args>(?s:.*?))\)'
     $match = [regex]::Match($content, $pattern)
 
     if (-not $match.Success) {
-        throw "Could not find any app.run(...) line in raul_manual.py"
+        throw "Could not find app.run(...) in raul_manual.py"
     }
 
-    $newLine = "    app.run(host=""0.0.0.0"", port=$Port, debug=True)"
-    $newContent = $content.Remove($match.Index, $match.Length).Insert($match.Index, $newLine)
+    $args = $match.Groups["args"].Value
+
+    if ($args -match '\bport\s*=\s*\d+') {
+        $newArgs = [regex]::Replace($args, '\bport\s*=\s*\d+', "port=$Port", 1)
+    }
+    else {
+        if ([string]::IsNullOrWhiteSpace($args)) {
+            $newArgs = "port=$Port"
+        }
+        else {
+            $newArgs = "$args, port=$Port"
+        }
+    }
+
+    if ($newArgs -match '\bhost\s*=\s*["''][^"'']*["'']') {
+        $newArgs = [regex]::Replace(
+            $newArgs,
+            '\bhost\s*=\s*["''][^"'']*["'']',
+            'host="0.0.0.0"',
+            1
+        )
+    }
+    else {
+        $newArgs = "host=`"0.0.0.0`", $newArgs"
+    }
+
+    $newCall = "app.run($newArgs)"
+    $newContent = $content.Remove($match.Index, $match.Length).Insert($match.Index, $newCall)
 
     [System.IO.File]::WriteAllText($manualPy, $newContent, $utf8NoBom)
 
     Write-OK "Updated RAULMANUAL port to $Port"
 }
 
+function Test-PythonCommand {
+    param([string]$PythonCommand)
+
+    try {
+        if ($PythonCommand -eq "py -3") {
+            $output = & py -3 --version 2>&1
+        }
+        else {
+            $output = & $PythonCommand --version 2>&1
+        }
+
+        if ($LASTEXITCODE -eq 0 -and ($output -join " ") -match "Python\s+3\.") {
+            return $true
+        }
+    }
+    catch {}
+
+    return $false
+}
+
 function Get-PythonCommand {
-    if (Get-Command python -ErrorAction SilentlyContinue) {
-        return "python"
+    if ((Get-Command py -ErrorAction SilentlyContinue) -and (Test-PythonCommand "py -3")) {
+        return "py -3"
     }
 
-    if (Get-Command py -ErrorAction SilentlyContinue) {
-        return "py -3"
+    if ((Get-Command python -ErrorAction SilentlyContinue) -and (Test-PythonCommand "python")) {
+        return "python"
     }
 
     return $null
@@ -305,7 +350,7 @@ function Invoke-Python {
         & py -3 @Arguments
     }
     else {
-        & python @Arguments
+        & $PythonCommand @Arguments
     }
 
     if ($LASTEXITCODE -ne 0) {
@@ -372,6 +417,7 @@ function Update-FirewallForPort {
 
 function Create-StartupBat {
     param(
+        [string]$PythonCommand,
         [string]$DashFolder,
         [string]$ManualFolder,
         [int]$Port
@@ -385,7 +431,7 @@ function Create-StartupBat {
 @echo off
 
 REM Start RAUL Dash
-start "RAUL Dash" cmd /k "title RAUL Dash && cd /d ""$DashFolder"" && python raultodash.py"
+start "RAUL Dash" cmd /k "title RAUL Dash && cd /d ""$DashFolder"" && $PythonCommand raultodash.py"
 
 REM Wait for RAULDASH menu to load
 timeout /t 3 /nobreak >nul
@@ -394,7 +440,7 @@ REM Select option 5 in RAUL Dash
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Add-Type -AssemblyName Microsoft.VisualBasic; Add-Type -AssemblyName System.Windows.Forms; [Microsoft.VisualBasic.Interaction]::AppActivate('RAUL Dash'); Start-Sleep -Milliseconds 500; [System.Windows.Forms.SendKeys]::SendWait('5{ENTER}')"
 
 REM Start RAUL Manual server
-start "RAUL Manual" cmd /k "title RAUL Manual && cd /d ""$ManualFolder"" && python raul_manual.py"
+start "RAUL Manual" cmd /k "title RAUL Manual && cd /d ""$ManualFolder"" && $PythonCommand raul_manual.py"
 
 REM Wait for manual server to start
 timeout /t 5 /nobreak >nul
@@ -433,12 +479,17 @@ $changePort = $false
 $selectedPort = $null
 
 if (-not [string]::IsNullOrWhiteSpace($portInput)) {
-    $selectedPort = [int]$portInput
+    $parsedPort = 0
 
-    if ($selectedPort -lt 1 -or $selectedPort -gt 65535) {
-        throw "Invalid port number: $selectedPort"
+    if (-not [int]::TryParse($portInput.Trim(), [ref]$parsedPort)) {
+        throw "RAULMANUAL port must be a number between 1 and 65535."
     }
 
+    if ($parsedPort -lt 1 -or $parsedPort -gt 65535) {
+        throw "Invalid port number: $parsedPort"
+    }
+
+    $selectedPort = $parsedPort
     $changePort = $true
 }
 
@@ -510,7 +561,7 @@ else {
 
 Install-PythonRequirements -PythonCommand $pythonCommand -DashFolder $DashFolder
 Update-FirewallForPort -Port $finalPort
-Create-StartupBat -DashFolder $DashFolder -ManualFolder $ManualFolder -Port $finalPort
+Create-StartupBat -PythonCommand $pythonCommand -DashFolder $DashFolder -ManualFolder $ManualFolder -Port $finalPort
 
 Write-Host ""
 Write-Host "======================================" -ForegroundColor Cyan
