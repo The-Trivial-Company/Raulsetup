@@ -4,6 +4,7 @@ Update-RAUL-Settings.ps1
 
 Purpose:
   Change RAUL tab name, project/job name, computer name, and RAULMANUAL port.
+  Also repairs the RAULMANUAL template/settings layout when needed.
 
 Run as Administrator:
   powershell -NoProfile -ExecutionPolicy Bypass -File .\Update-RAUL-Settings.ps1
@@ -69,6 +70,45 @@ function Save-XmlDocument {
     }
     finally {
         $writer.Close()
+    }
+}
+
+function Ensure-RaulManualPackageLayout {
+    param(
+        [string]$ManualFolder,
+        [string]$DashFolder
+    )
+
+    # Flask render_template() expects these HTML files under templates.
+    $templatesFolder = Join-Path $ManualFolder "templates"
+    New-Item -ItemType Directory -Path $templatesFolder -Force | Out-Null
+
+    foreach ($templateName in @("raul_manual.html", "settings.html")) {
+        $rootTemplate = Join-Path $ManualFolder $templateName
+        $templateTarget = Join-Path $templatesFolder $templateName
+
+        if ((Test-Path $rootTemplate) -and -not (Test-Path $templateTarget)) {
+            Copy-Item -Path $rootTemplate -Destination $templateTarget -Force
+            Write-OK "Placed $templateName in Flask templates folder."
+        }
+    }
+
+    # RAULMANUAL uses settings.xml for ProjectName. Seed it from RAULDASH when
+    # upgrading an installation made from an older/current package missing it.
+    $manualSettings = Join-Path $ManualFolder "settings.xml"
+
+    if (-not (Test-Path $manualSettings)) {
+        $dashSettings = Get-FirstExistingPath @(
+            (Join-Path $DashFolder "settings.xml"),
+            (Join-Path $DashFolder "settings")
+        )
+
+        if (-not $dashSettings) {
+            throw "Could not create RAULMANUAL settings.xml because RAULDASH settings.xml/settings was not found."
+        }
+
+        Copy-Item -Path $dashSettings -Destination $manualSettings -Force
+        Write-OK "Created missing RAULMANUAL settings.xml from RAULDASH settings."
     }
 }
 
@@ -457,6 +497,10 @@ if (-not (Test-Path $ManualFolder)) {
 }
 
 Write-Info "RAUL folder: $RaulRoot"
+
+# Repair/verify the updated RAULMANUAL package structure before reading or
+# changing settings. This is harmless on already-correct installations.
+Ensure-RaulManualPackageLayout -ManualFolder $ManualFolder -DashFolder $DashFolder
 
 $currentSettings = Get-CurrentSettings -DashFolder $DashFolder -ManualFolder $ManualFolder
 $currentPort = Get-CurrentRaulManualPort -ManualFolder $ManualFolder
