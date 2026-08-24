@@ -296,7 +296,7 @@ function Get-FromSources {
 
     $local = Join-Path $WorkDir $LocalName
 
-    if (Test-Path $local -and (Get-Item $local).Length -ge $MinBytes -and (Test-NotHtml $local)) {
+    if ((Test-Path $local) -and ((Get-Item $local).Length -ge $MinBytes) -and (Test-NotHtml $local)) {
         if (($Kind -eq "Installer" -and (Test-InstallerMagic $local)) -or ($Kind -eq "Zip" -and (Test-ZipMagic $local))) {
             WriteLog "Using local cached file: $local"
             return $local
@@ -1029,7 +1029,7 @@ try {
     Log "SUCCESS: Configured '$newAlias' as $IPAddress/$Prefix with no gateway."
 
     # Configuration is complete, so the temporary watcher is no longer needed.
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    & schtasks.exe /Delete /TN $TaskName /F *> $null
     exit 0
 }
 catch {
@@ -1048,35 +1048,16 @@ catch {
     # Remove an older copy of the task before creating the new temporary watcher.
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 
-    $action = New-ScheduledTaskAction `
-        -Execute "powershell.exe" `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$watcherPath`""
+    # Use schtasks instead of PowerShell trigger.Repetition properties because
+    # those properties are not writable on some Windows 10 ScheduledTasks builds.
+    $taskCommand = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$watcherPath`""
+    & schtasks.exe /Create /TN $taskName /TR $taskCommand /SC MINUTE /MO 2 /RU SYSTEM /RL HIGHEST /F | Out-Null
 
-    # Run shortly after startup, then retry every 2 minutes. Once the PLC Ethernet
-    # is successfully configured, the watcher removes this task itself.
-    $trigger = New-ScheduledTaskTrigger -AtStartup
-    $trigger.Repetition.Interval = "PT2M"
-    $trigger.Repetition.Duration = "P3650D"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not create temporary PLC Ethernet watcher scheduled task."
+    }
 
-    $principal = New-ScheduledTaskPrincipal `
-        -UserId "SYSTEM" `
-        -LogonType ServiceAccount `
-        -RunLevel Highest
-
-    $settings = New-ScheduledTaskSettingsSet `
-        -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries `
-        -StartWhenAvailable
-
-    Register-ScheduledTask `
-        -TaskName $taskName `
-        -Action $action `
-        -Trigger $trigger `
-        -Principal $principal `
-        -Settings $settings `
-        -Force | Out-Null
-
-    Report "Created temporary PLC Ethernet watcher. It will configure the first active non-Internet Ethernet connection as $IPAddress/$Prefix, then remove its scheduled task."
+    Report "Created temporary PLC Ethernet watcher. It checks every 2 minutes for an active non-Internet Ethernet connection, configures it as $IPAddress/$Prefix, then removes its scheduled task."
 }
 
 function Get-FirstExistingPath {
@@ -1106,6 +1087,63 @@ function Save-XmlDocument {
     finally {
         $writer.Close()
     }
+}
+
+function Ensure-RaulManualPackageLayout {
+    param(
+        [string]$ManualFolder,
+        [string]$DashFolder
+    )
+
+    # Flask render_template() looks in a templates subfolder by default.
+    $templatesFolder = Join-Path $ManualFolder "templates"
+    New-Item -ItemType Directory -Path $templatesFolder -Force | Out-Null
+
+    foreach ($templateName in @("raul_manual.html", "settings.html")) {
+        $rootTemplate = Join-Path $ManualFolder $templateName
+        $templateTarget = Join-Path $templatesFolder $templateName
+
+        if ((Test-Path $rootTemplate) -and -not (Test-Path $templateTarget)) {
+            Copy-Item -Path $rootTemplate -Destination $templateTarget -Force
+            Report "Placed RAULMANUAL template in Flask templates folder: $templateTarget"
+        }
+    }
+
+    # The updated RAUL Manual backend still reads ProjectName from settings.xml.
+    # The current Drive ZIP does not contain this file, so seed it from RAULDASH.
+    $manualSettings = Join-Path $ManualFolder "settings.xml"
+    if (-not (Test-Path $manualSettings)) {
+        $dashSettings = Get-FirstExistingPath @(
+            (Join-Path $DashFolder "settings.xml"),
+            (Join-Path $DashFolder "settings")
+        )
+
+        if (-not $dashSettings) {
+            throw "Could not create RAULMANUAL settings.xml because RAULDASH settings.xml/settings was not found."
+        }
+
+        Copy-Item -Path $dashSettings -Destination $manualSettings -Force
+        Report "Created missing RAULMANUAL settings.xml from RAULDASH settings."
+    }
+}
+
+function Get-RaulManualPortFromFile {
+    param([string]$ManualFolder)
+
+    $manualPy = Join-Path $ManualFolder "raul_manual.py"
+    if (-not (Test-Path $manualPy)) { return $null }
+
+    try {
+        $content = [System.IO.File]::ReadAllText($manualPy, [System.Text.Encoding]::UTF8)
+        $match = [regex]::Match($content, 'app\.run\s*\((?s:.*?)\bport\s*=\s*(\d+)(?s:.*?)\)')
+        if ($match.Success) {
+            $port = [int]$match.Groups[1].Value
+            if ($port -ge 1 -and $port -le 65535) { return $port }
+        }
+    }
+    catch {}
+
+    return $null
 }
 
 function Update-RaulSettingsFile {
@@ -1226,44 +1264,41 @@ function Update-RaulManualServerPort {
         throw "Invalid RAULMANUAL port: $port"
     }
 
-    $changed = 0
-
-    $candidateFiles = Get-ChildItem -Path $ManualFolder -Recurse -File -Include "*.py","*.txt","*.xml","*.json","*.html","*.js" -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.FullName -notmatch "\\Old Versions\\" -and
-            $_.FullName -notmatch "\\__pycache__\\"
-        }
-
-    foreach ($file in $candidateFiles) {
-        try {
-            $content = Get-Content -Path $file.FullName -Raw -ErrorAction Stop
-            $updated = $content
-
-            # Python Flask app.run(...) server port references.
-            $updated = [regex]::Replace($updated, 'port\s*=\s*5000', "port=$port")
-
-            # Literal local URLs used by RAULMANUAL itself, if present.
-            $updated = $updated -replace 'http://127\.0\.0\.1:5000', "http://127.0.0.1:$port"
-            $updated = $updated -replace 'http://localhost:5000', "http://localhost:$port"
-
-            # Do NOT replace standalone "5000" values because several HTML files use 5000ms refresh intervals.
-            if ($updated -ne $content) {
-                Set-Content -Path $file.FullName -Value $updated -Encoding UTF8
-                $changed++
-                WriteLog "Updated RAULMANUAL server port in $($file.FullName)"
-            }
-        }
-        catch {
-            WriteLog "WARNING: Could not update RAULMANUAL server port in $($file.FullName): $($_.Exception.Message)"
-        }
+    $manualPy = Join-Path $ManualFolder "raul_manual.py"
+    if (-not (Test-Path $manualPy)) {
+        throw "Could not find raul_manual.py at $manualPy"
     }
 
-    if ($changed -eq 0) {
-        $Global:ChangeReport += "WARNING: No RAULMANUAL server port references were updated. Expected app.run(... port=5000 ...) in RAULMANUAL."
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $content = [System.IO.File]::ReadAllText($manualPy, [System.Text.Encoding]::UTF8)
+    $pattern = 'app\.run\s*\((?<args>(?s:.*?))\)'
+    $match = [regex]::Match($content, $pattern)
+
+    if (-not $match.Success) {
+        throw "Could not find app.run(...) in raul_manual.py"
+    }
+
+    $args = $match.Groups["args"].Value
+
+    if ($args -match '\bport\s*=\s*\d+') {
+        $newArgs = [regex]::Replace($args, '\bport\s*=\s*\d+', "port=$port", 1)
     }
     else {
-        Report "Updated RAULMANUAL app server port to $port in $changed file(s)."
+        $newArgs = if ([string]::IsNullOrWhiteSpace($args)) { "port=$port" } else { "$args, port=$port" }
     }
+
+    if ($newArgs -match '\bhost\s*=\s*["''][^"'']*["'']') {
+        $newArgs = [regex]::Replace($newArgs, '\bhost\s*=\s*["''][^"'']*["'']', 'host="0.0.0.0"', 1)
+    }
+    else {
+        $newArgs = "host=`"0.0.0.0`", $newArgs"
+    }
+
+    $newCall = "app.run($newArgs)"
+    $newContent = $content.Remove($match.Index, $match.Length).Insert($match.Index, $newCall)
+    [System.IO.File]::WriteAllText($manualPy, $newContent, $utf8NoBom)
+
+    Report "Updated RAULMANUAL app server port to $port."
 }
 
 function Install-RaulPythonPackages {
@@ -1350,11 +1385,27 @@ function Install-RaulApp {
     $dashFolder = Join-Path $InstallRoot "RAULDASH"
     $manualFolder = Join-Path $InstallRoot "RAULMANUAL"
 
+    # Install shared Python requirements before XML/template configuration so a
+    # configuration problem cannot leave RAULMANUAL without its dependencies.
+    Install-RaulPythonPackages -PythonCommand $PythonCommand -DashFolder $dashFolder
+
+    # Update RAULDASH first, then use it to seed the missing Manual settings.xml
+    # and correct the Flask template folder layout in the current Drive ZIP.
     Update-RaulSettingsFile -Folder $dashFolder -TabName $TabName -ProjectName $ProjectName
+    Ensure-RaulManualPackageLayout -ManualFolder $manualFolder -DashFolder $dashFolder
     Update-RaulSettingsFile -Folder $manualFolder -TabName $TabName -ProjectName $ProjectName
     Update-RaulManualConfig -ManualFolder $manualFolder -TabName $TabName
-    Update-RaulManualServerPort -ManualFolder $manualFolder -ManualServerUrl $ManualServerUrl
-    Install-RaulPythonPackages -PythonCommand $PythonCommand -DashFolder $dashFolder
+
+    if ([string]::IsNullOrWhiteSpace($ManualServerUrl)) {
+        $packagedPort = Get-RaulManualPortFromFile -ManualFolder $manualFolder
+        if (-not $packagedPort) { $packagedPort = 5002 }
+        $ManualServerUrl = "http://127.0.0.1:$packagedPort"
+        Report "RAULMANUAL port left unchanged from package: $packagedPort"
+    }
+    else {
+        Update-RaulManualServerPort -ManualFolder $manualFolder -ManualServerUrl $ManualServerUrl
+    }
+
     Create-RaulStartupFile -PythonCommand $PythonCommand -DashFolder $dashFolder -ManualFolder $manualFolder -ManualServerUrl $ManualServerUrl
 
     Report "RAUL 2.0 installed to $InstallRoot"
@@ -1421,12 +1472,18 @@ $wantDpi = Read-Host "Set display scaling to 125%? (Y/N, default N)"
 Write-Host ""
 $tabName = (Read-Host "Enter RAUL LocationLog tab name").Trim()
 $projectName = (Read-Host "Enter RAUL ProjectName").Trim()
-$manualServerPortInput = (Read-Host "Enter RAULMANUAL port, or press ENTER for 5000").Trim()
+$manualServerPortInput = (Read-Host "Enter RAULMANUAL port, or press ENTER to keep the port packaged with RAULMANUAL (currently 5002)").Trim()
 
 if ([string]::IsNullOrWhiteSpace($tabName)) { throw "LocationLog tab name cannot be blank." }if ([string]::IsNullOrWhiteSpace($projectName)) { throw "ProjectName cannot be blank." }
 
-$manualServerUrl = Resolve-ManualServerUrlFromPort -PortInput $manualServerPortInput
-WriteLog "RAULMANUAL server URL resolved to $manualServerUrl"
+if ([string]::IsNullOrWhiteSpace($manualServerPortInput)) {
+    $manualServerUrl = ""
+    WriteLog "RAULMANUAL port will be preserved from the downloaded package."
+}
+else {
+    $manualServerUrl = Resolve-ManualServerUrlFromPort -PortInput $manualServerPortInput
+    WriteLog "RAULMANUAL server URL resolved to $manualServerUrl"
+}
 $needReboot = $false
 
 if ($desiredComputerName -and $desiredComputerName -ne $env:COMPUTERNAME) {
