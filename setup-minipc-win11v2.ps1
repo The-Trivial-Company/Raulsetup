@@ -1398,7 +1398,7 @@ function Install-RaulApp {
 
     if ([string]::IsNullOrWhiteSpace($ManualServerUrl)) {
         $packagedPort = Get-RaulManualPortFromFile -ManualFolder $manualFolder
-        if (-not $packagedPort) { $packagedPort = 5002 }
+        if (-not $packagedPort) { $packagedPort = 5000 }
         $ManualServerUrl = "http://127.0.0.1:$packagedPort"
         Report "RAULMANUAL port left unchanged from package: $packagedPort"
     }
@@ -1472,7 +1472,7 @@ $wantDpi = Read-Host "Set display scaling to 125%? (Y/N, default N)"
 Write-Host ""
 $tabName = (Read-Host "Enter RAUL LocationLog tab name").Trim()
 $projectName = (Read-Host "Enter RAUL ProjectName").Trim()
-$manualServerPortInput = (Read-Host "Enter RAULMANUAL port, or press ENTER to keep the port packaged with RAULMANUAL (currently 5002)").Trim()
+$manualServerPortInput = (Read-Host "Enter RAULMANUAL port, or press ENTER to keep the port packaged with RAULMANUAL (currently 5000)").Trim()
 
 if ([string]::IsNullOrWhiteSpace($tabName)) { throw "LocationLog tab name cannot be blank." }if ([string]::IsNullOrWhiteSpace($projectName)) { throw "ProjectName cannot be blank." }
 
