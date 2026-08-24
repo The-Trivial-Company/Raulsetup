@@ -20,11 +20,11 @@ This combined script:
       enables ClearType
       disables OneDrive
       reduces Edge prompts/shortcuts
-      optionally configures the PLC Ethernet adapter
+      optionally configures the PLC Ethernet adapter, or installs a temporary watcher if it is not connected yet
   - Downloads and unzips RAUL 2.0
   - Updates RAULDASH and RAULMANUAL settings
   - Updates RAULMANUAL raul_config tab_name
-  - Installs RAULDASH Python requirements and Flask
+  - Installs shared RAUL Python requirements once from RAULDASH, plus Flask for RAULMANUAL
   - Creates a Windows startup BAT file that starts both RAUL apps
 #>
 
@@ -34,7 +34,7 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # ==================== LINKS ====================
-$GDRIVE_RAUL_ZIP    = "https://drive.google.com/file/d/1EYRUZByBWuTKHPfY0sN6Lw_IQgSYTmu_/view?usp=sharing"
+$GDRIVE_RAUL_ZIP    = "https://drive.google.com/file/d/1VpRz3Wj2xd3TcItPsMvSAF9Kv6BVnPRH/view?usp=sharing"
 $GDRIVE_PY_EXE      = "https://drive.google.com/file/d/1PANRP9dGXGla93-BdI3AfmnnDpKNblEG/view?usp=sharing"
 $GDRIVE_MEB_EXE     = "https://drive.google.com/file/d/1_-YOGugROM57rIpOz0ODy8EBL8AuR0X-/view?usp=sharing"
 $GDRIVE_CRD_MSI     = "https://drive.google.com/file/d/1G6IY2CRWAdnTLKcjStJGMQFELX85VEwI/view?usp=sharing"
@@ -866,38 +866,72 @@ function Get-PLCSuffix {
     return "A"
 }
 
-function Set-PLCAdapter {
-    param(
-        [string]$IPAddress = "192.168.1.100",
-        [int]$Prefix = 24
+function Get-PLCAdapterCandidate {
+    $defaultIfIndexes = @(
+        Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
+        Where-Object { $_.NextHop -and $_.NextHop -ne "0.0.0.0" } |
+        Select-Object -ExpandProperty ifIndex -Unique
     )
 
-    $defaultIf = Get-DefaultRouteIfIndex
-    $candidates = Get-NetAdapter -Physical |
+    $candidates = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
         Where-Object {
             $_.Status -eq "Up" -and
             $_.HardwareInterface -and
             $_.MediaType -in 802.3, "Ethernet" -and
-            $_.ifIndex -ne $defaultIf -and
+            $_.ifIndex -notin $defaultIfIndexes -and
             $_.Name -notmatch "vEthernet|Bluetooth|Wi-?Fi"
         }
 
     if (-not $candidates) {
-        throw "No PLC NIC candidate found. Connect the second Ethernet adapter and try again."
+        return $null
     }
 
-    $nic = $candidates | Where-Object { $_.InterfaceDescription -match "Realtek.*USB" } | Select-Object -First 1
-    if (-not $nic) { $nic = $candidates | Select-Object -First 1 }
+    # Prefer a USB Ethernet adapter when one is present because that is commonly
+    # the dedicated PLC connection on RAUL computers.
+    $nic = $candidates |
+        Where-Object { $_.InterfaceDescription -match "Realtek.*USB|USB.*Ethernet|Ethernet.*USB" } |
+        Select-Object -First 1
+
+    if (-not $nic) {
+        $nic = $candidates | Select-Object -First 1
+    }
+
+    return $nic
+}
+
+function Set-PLCAdapter {
+    param(
+        [string]$IPAddress = "192.168.1.100",
+        [int]$Prefix = 24,
+        [switch]$NoThrowIfMissing
+    )
+
+    $nic = Get-PLCAdapterCandidate
+
+    if (-not $nic) {
+        $message = "No active non-Internet Ethernet adapter is currently available for the PLC connection."
+        if ($NoThrowIfMissing) {
+            WriteLog $message
+            return $false
+        }
+        throw $message
+    }
 
     $newAlias = "PLC$(Get-PLCSuffix)"
+
     if ($nic.Name -ne $newAlias) {
         Rename-NetAdapter -Name $nic.Name -NewName $newAlias -PassThru | Out-Null
-    }    Set-NetIPInterface -InterfaceAlias $newAlias -Dhcp Disabled -AddressFamily IPv4 -ErrorAction SilentlyContinue
+    }
+
+    Set-NetIPInterface -InterfaceAlias $newAlias -Dhcp Disabled -AddressFamily IPv4 -ErrorAction SilentlyContinue
+
     Get-NetIPAddress -InterfaceAlias $newAlias -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object { $_.IPAddress -ne $IPAddress } |
         Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
 
-    if (-not (Get-NetIPAddress -InterfaceAlias $newAlias -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq $IPAddress })) {
+    if (-not (Get-NetIPAddress -InterfaceAlias $newAlias -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -eq $IPAddress })) {
+
         New-NetIPAddress -InterfaceAlias $newAlias -IPAddress $IPAddress -PrefixLength $Prefix -ErrorAction Stop | Out-Null
     }
 
@@ -906,6 +940,143 @@ function Set-PLCAdapter {
     Set-DnsClientServerAddress -InterfaceAlias $newAlias -ResetServerAddresses
 
     Report "PLC NIC '$newAlias' set to $IPAddress/$Prefix with no gateway."
+    return $true
+}
+
+
+function Install-PLCAdapterWatcher {
+    param(
+        [string]$IPAddress = "192.168.1.100",
+        [int]$Prefix = 24
+    )
+
+    $watcherPath = Join-Path $StableDir "Configure-RAUL-PLC-NIC.ps1"
+    $taskName = "RAUL Configure PLC Ethernet"
+
+    $watcher = @'
+$ErrorActionPreference = "Stop"
+
+$IPAddress = "__PLC_IP__"
+$Prefix = __PLC_PREFIX__
+$TaskName = "__TASK_NAME__"
+$LogPath = "__LOG_PATH__"
+
+function Log {
+    param([string]$Message)
+    $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
+    $line | Out-File -FilePath $LogPath -Append -Encoding utf8 -Force
+}
+
+function Get-PLCSuffix {
+    $match = [regex]::Match($env:COMPUTERNAME, "([A-Za-z])(?!.*[A-Za-z])")
+    if ($match.Success) { return $match.Groups[1].Value.ToUpper() }
+    return "A"
+}
+
+try {
+    $defaultIfIndexes = @(
+        Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue |
+        Where-Object { $_.NextHop -and $_.NextHop -ne "0.0.0.0" } |
+        Select-Object -ExpandProperty ifIndex -Unique
+    )
+
+    $candidates = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Status -eq "Up" -and
+            $_.HardwareInterface -and
+            $_.MediaType -in 802.3, "Ethernet" -and
+            $_.ifIndex -notin $defaultIfIndexes -and
+            $_.Name -notmatch "vEthernet|Bluetooth|Wi-?Fi"
+        }
+
+    if (-not $candidates) {
+        Log "No active non-Internet Ethernet adapter found yet."
+        exit 0
+    }
+
+    $nic = $candidates |
+        Where-Object { $_.InterfaceDescription -match "Realtek.*USB|USB.*Ethernet|Ethernet.*USB" } |
+        Select-Object -First 1
+
+    if (-not $nic) {
+        $nic = $candidates | Select-Object -First 1
+    }
+
+    $newAlias = "PLC$(Get-PLCSuffix)"
+
+    Log "Found PLC Ethernet candidate: $($nic.Name) / $($nic.InterfaceDescription)"
+
+    if ($nic.Name -ne $newAlias) {
+        Rename-NetAdapter -Name $nic.Name -NewName $newAlias -PassThru | Out-Null
+    }
+
+    Set-NetIPInterface -InterfaceAlias $newAlias -Dhcp Disabled -AddressFamily IPv4 -ErrorAction SilentlyContinue
+
+    Get-NetIPAddress -InterfaceAlias $newAlias -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -ne $IPAddress } |
+        Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+
+    if (-not (Get-NetIPAddress -InterfaceAlias $newAlias -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -eq $IPAddress })) {
+
+        New-NetIPAddress -InterfaceAlias $newAlias -IPAddress $IPAddress -PrefixLength $Prefix -ErrorAction Stop | Out-Null
+    }
+
+    Set-NetConnectionProfile -InterfaceAlias $newAlias -NetworkCategory Private -ErrorAction SilentlyContinue
+    Disable-NetAdapterBinding -Name $newAlias -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+    Set-DnsClientServerAddress -InterfaceAlias $newAlias -ResetServerAddresses
+
+    Log "SUCCESS: Configured '$newAlias' as $IPAddress/$Prefix with no gateway."
+
+    # Configuration is complete, so the temporary watcher is no longer needed.
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    exit 0
+}
+catch {
+    Log "ERROR: $($_.Exception.Message)"
+    exit 1
+}
+'@
+
+    $watcher = $watcher.Replace("__PLC_IP__", $IPAddress)
+    $watcher = $watcher.Replace("__PLC_PREFIX__", [string]$Prefix)
+    $watcher = $watcher.Replace("__TASK_NAME__", $taskName)
+    $watcher = $watcher.Replace("__LOG_PATH__", (Join-Path $StableDir "raul-plc-nic-watcher.log"))
+
+    $watcher | Out-File -FilePath $watcherPath -Encoding UTF8 -Force
+
+    # Remove an older copy of the task before creating the new temporary watcher.
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+
+    $action = New-ScheduledTaskAction `
+        -Execute "powershell.exe" `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$watcherPath`""
+
+    # Run shortly after startup, then retry every 2 minutes. Once the PLC Ethernet
+    # is successfully configured, the watcher removes this task itself.
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $trigger.Repetition.Interval = "PT2M"
+    $trigger.Repetition.Duration = "P3650D"
+
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId "SYSTEM" `
+        -LogonType ServiceAccount `
+        -RunLevel Highest
+
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable
+
+    Register-ScheduledTask `
+        -TaskName $taskName `
+        -Action $action `
+        -Trigger $trigger `
+        -Principal $principal `
+        -Settings $settings `
+        -Force | Out-Null
+
+    Report "Created temporary PLC Ethernet watcher. It will configure the first active non-Internet Ethernet connection as $IPAddress/$Prefix, then remove its scheduled task."
 }
 
 function Get-FirstExistingPath {
@@ -1113,14 +1284,16 @@ function Install-RaulPythonPackages {
         finally {
             Pop-Location
         }
-        Report "Installed RAULDASH requirements.txt."
+        Report "Installed shared RAUL requirements.txt from RAULDASH."
     }
     else {
         $Global:ChangeReport += "WARNING: requirements.txt was not found in $DashFolder"
     }
 
+    # RAULMANUAL uses the same shared libraries as RAULDASH.
+    # Flask is the only additional package required by the Manual web app.
     Invoke-Python -PythonCommand $PythonCommand -Arguments @("-m", "pip", "install", "flask")
-    Report "Installed Flask."
+    Report "Installed/verified Flask for RAULMANUAL."
 }
 
 function Install-RaulApp {
@@ -1359,7 +1532,18 @@ else {
 Try-Run { Reduce-EdgePrompts } "Reduce Edge prompts/shortcuts"
 
 if ($configurePLC) {
-    Try-Run { Set-PLCAdapter -IPAddress "192.168.1.100" -Prefix 24 } "Configure PLC NIC"
+    try {
+        $plcConfigured = Set-PLCAdapter -IPAddress "192.168.1.100" -Prefix 24 -NoThrowIfMissing
+
+        if (-not $plcConfigured) {
+            Install-PLCAdapterWatcher -IPAddress "192.168.1.100" -Prefix 24
+            $Global:ChangeReport += "PENDING: PLC Ethernet is not connected. A temporary watcher will configure it automatically when an active non-Internet Ethernet connection appears."
+        }
+    }
+    catch {
+        WriteLog "ERR: Configure PLC NIC :: $($_.Exception.Message)"
+        $Global:ChangeReport += "FAILED: Configure PLC NIC ($($_.Exception.Message))"
+    }
 }
 else {
     Report "Skipped PLC NIC configuration."
