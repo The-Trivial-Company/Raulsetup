@@ -1449,14 +1449,14 @@ start "" "$ManualServerUrl"
 }
 
 
-# ==================== NETWORK RECOVERY (NO TAILSCALE) ====================
+# ==================== NETWORK RECOVERY ====================
 function Install-TrivialNetworkRecovery {
     $networkDir = Join-Path $StableDir "NetworkRecovery"
     New-Item -ItemType Directory -Path $networkDir -Force | Out-Null
     $watchdogPath = Join-Path $networkDir "Trivial-Network-Watchdog.ps1"
     $watchdogCode = @'
 # Trivial LLC - Network Recovery Watchdog (Windows 10/11, Windows PowerShell 5.1)
-# Runs as SYSTEM every 2 minutes. Does not use Tailscale.
+# Runs as SYSTEM every 2 minutes.
 # Reconnects to existing ALL-USER saved Wi-Fi profiles when Wi-Fi is disconnected.
 # Only reboots after 15 minutes without Wi-Fi AND without usable routed Ethernet.
 $ErrorActionPreference = 'Stop'
@@ -1651,7 +1651,7 @@ $installPython = Prompt-YesNo "Install/check Python and PATH?" $true
 $configurePLC = Prompt-YesNo "Configure PLC Ethernet adapter to 192.168.1.100?" $true
 $disableUpdates = Prompt-YesNo "Disable automatic Windows Update services/policies?" $true
 $disableOneDrive = Prompt-YesNo "Remove/disable OneDrive?" $true
-$installNetworkRecovery = Prompt-YesNo "Install Ethernet-aware Wi-Fi recovery watchdog (no Tailscale)?" $true
+$installNetworkRecovery = Prompt-YesNo "Install Ethernet-aware Wi-Fi recovery watchdog?" $true
 
 Write-Host ""
 $desiredComputerName = Read-Host "Enter computer name, or press ENTER to keep $env:COMPUTERNAME"
